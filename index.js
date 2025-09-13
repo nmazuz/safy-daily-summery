@@ -51,6 +51,35 @@ function normalizeTsToSeconds(ts) {
   return n > 1e12 ? Math.floor(n / 1000) : n;
 }
 
+// Extract the main conversation ID from various conv_id formats
+function extractMainConvId(convId) {
+  if (!convId) return 'unknown';
+  
+  // Handle direct_*_*@lid format: extract the first part after direct_
+  if (convId.startsWith('direct_')) {
+    const parts = convId.split('_');
+    if (parts.length >= 2) {
+      // Find the part that ends with @g.us or @c.us
+      for (let i = 1; i < parts.length; i++) {
+        if (parts[i].includes('@g.us') || parts[i].includes('@c.us')) {
+          return parts[i];
+        }
+      }
+    }
+  }
+  
+  // Handle group_*@g.us format: extract the part after group_
+  if (convId.startsWith('group_')) {
+    const parts = convId.split('_');
+    if (parts.length >= 2) {
+      return parts[1];
+    }
+  }
+  
+  // For other formats, return as-is
+  return convId;
+}
+
 // ====== Main ======
 (async function main() {
   const { startSec, endSec, startMs, endMs, isoDate } = startEndOfTodaySeconds(TZ);
@@ -69,6 +98,7 @@ function normalizeTsToSeconds(ts) {
       a.offense_type AS offense_type,
       m.modality AS modality,
       m.is_group AS is_group,
+      m.sender_hash,
       m.ts AS ts
     FROM analysis a
     JOIN messages m ON a.message_id = m.id
@@ -88,7 +118,7 @@ function normalizeTsToSeconds(ts) {
   // Group by conv_id and build minimal, PII-redacted payload
   const byConv = new Map();
   for (const r of rows) {
-    const key = r.conv_id || 'unknown';
+    const key = extractMainConvId(r.conv_id);
     const arr = byConv.get(key) || [];
     arr.push({
       message_text: redactPII(r.message_text),
@@ -96,19 +126,71 @@ function normalizeTsToSeconds(ts) {
       offense_type: r.offense_type || '',
       modality: r.modality,           // 'text' | 'image' | 'audio'
       is_group: !!r.is_group,
+      sender: r.sender_hash,
       ts: normalizeTsToSeconds(r.ts), // number (seconds)
     });
     byConv.set(key, arr);
   }
 
-  if (byConv.size === 0) {
+  // Get chats with daily_summery = 1
+  const dailySummarySql = `
+    SELECT chat_id 
+    FROM chats 
+    WHERE daily_summary = 1
+  `;
+  const dailySummaryStmt = db.prepare(dailySummarySql);
+  const dailySummaryChats = dailySummaryStmt.all();
+  
+  console.log('Chats with daily_summary=1:', dailySummaryChats.map(c => c.chat_id));
+  
+  // Check how many messages each daily summary chat has in byConv
+  const checkingList = [];
+  const dailySummaryChatIds = new Set(dailySummaryChats.map(c => c.chat_id));
+  
+  for (const [convKey, messages] of byConv.entries()) {
+    if (dailySummaryChatIds.has(convKey)) {
+      checkingList.push({ convKey, messageCount: messages.length, isDailySummary: true });
+      console.log(`Added daily summary chat ${convKey} with ${messages.length} messages`);
+    }
+  }
+  
+  // If less than 3 items, add chats with most messages from byConv
+  if (checkingList.length < 3) {
+    const remainingChats = Array.from(byConv.entries())
+      .filter(([convKey]) => !dailySummaryChatIds.has(convKey))
+      .map(([convKey, messages]) => ({ convKey, messageCount: messages.length, isDailySummary: false }))
+      .sort((a, b) => b.messageCount - a.messageCount); // Sort by message count descending
+    
+    const needed = 3 - checkingList.length;
+    const additionalChats = remainingChats.slice(0, needed);
+    
+    checkingList.push(...additionalChats);
+    console.log(`Added ${additionalChats.length} additional chats with most messages:`, 
+      additionalChats.map(c => `${c.convKey} (${c.messageCount} msgs)`));
+  }
+  
+  console.log(`Final checking list (${checkingList.length} chats):`, 
+    checkingList.map(c => `${c.convKey} (${c.messageCount} msgs, daily: ${c.isDailySummary})`));
+  
+  // Filter byConv to only include chats in checking list
+  const selectedConvKeys = new Set(checkingList.map(c => c.convKey));
+  const filteredByConv = new Map();
+  for (const [convKey, messages] of byConv.entries()) {
+    if (selectedConvKeys.has(convKey)) {
+      filteredByConv.set(convKey, messages);
+    }
+  }
+  
+  console.log(`Selected ${filteredByConv.size} chats for analysis`);
+  if (filteredByConv.size === 0) {
     console.log(`[${isoDate}] No messages for today in timezone ${TZ}.`);
     process.exit(0);
   }
 
+
   // Send per-conversation payloads
   const results = [];
-  for (const [conv_id, messages] of byConv.entries()) {
+  for (const [conv_id, messages] of filteredByConv.entries()) {
     const payload = {
       conv_id,
       date_tz: TZ,
