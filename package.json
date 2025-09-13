@@ -1,0 +1,18 @@
+{
+  "name": "chat-summery",
+  "version": "1.0.0",
+  "description": "Chat summary analysis tool",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.0.0",
+    "dotenv": "^16.3.1",
+    "luxon": "^3.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
